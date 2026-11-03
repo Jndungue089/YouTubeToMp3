@@ -1,7 +1,12 @@
 # Required libraries
 import os
-from moviepy.editor import VideoFileClip
-from pytube import YouTube
+import re
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from moviepy.editor import AudioFileClip
+from pytubefix import YouTube
+
+DEFAULT_WORKERS = 4
 
 def printBanner():
     """
@@ -31,35 +36,82 @@ def printMenu():
     print("1. Start")
     print("2. Exit")
 
+def sanitize(name):
+    """
+    Remove characters that are invalid in file names.
+    """
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip() or "audio"
+
+def uniquePath(directory, name):
+    """
+    Return a non-existing mp3 path inside directory.
+    """
+    path = os.path.join(directory, f"{name}.mp3")
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(directory, f"{name} ({i}).mp3")
+        i += 1
+    return path
+
+def convertOne(url, outputDir):
+    """
+    Download a single YouTube URL and convert it to mp3.
+    Returns (url, output path). Raises on failure.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        youtube = YouTube(url)
+        stream = youtube.streams.get_audio_only() or youtube.streams.first()
+        downloadedFile = stream.download(output_path=tmp)
+        outputPath = uniquePath(outputDir, sanitize(youtube.title))
+        clip = AudioFileClip(downloadedFile)
+        try:
+            clip.write_audiofile(outputPath, logger=None)
+        finally:
+            clip.close()
+    return url, outputPath
+
+def readUrls():
+    """
+    Read several URLs (separated by spaces, commas or new lines).
+    An empty line finishes the input.
+    """
+    print("Enter YouTube URLs (several per line allowed). Empty line to finish:")
+    urls = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        urls.extend(u for u in re.split(r"[\s,]+", line) if u)
+    return urls
+
 def startConversion():
     """
-    Function to convert a YouTube video into an mp3 file.
+    Convert several YouTube videos into mp3 files, in parallel.
     """
-    downloadedFile = None
-    try:
-        # Get user inputs for YouTube URL and output filename
-        youtubeUrl = input("Enter the YouTube URL: ")
-        outputFileName = input("Enter the output filename: ")
+    urls = readUrls()
+    if not urls:
+        print("No URLs given.")
+        return
 
-        # Create YouTube object and download the first stream
-        youtube = YouTube(youtubeUrl)
-        stream = youtube.streams.first()
-        downloadedFile = stream.download()
+    outputDir = input("Output folder [current folder]: ").strip() or "."
+    workersInput = input(f"Parallel downloads [{DEFAULT_WORKERS}]: ").strip()
+    workers = int(workersInput) if workersInput.isdigit() and int(workersInput) > 0 else DEFAULT_WORKERS
+    os.makedirs(outputDir, exist_ok=True)
 
-        # Convert the downloaded file to mp3
-        clip = VideoFileClip(downloadedFile)
-        clip.audio.write_audiofile(f'{outputFileName}.mp3')
-        # Close the clip to free the file
-        clip.close()
-
-        print("Conversion completed!")
-    except Exception as e:
-        # If any errors occur during the conversion process, print an error message
-        print(f"An error occurred: {e}")
-    finally:
-        # Delete the downloaded file after conversion, if it exists
-        if downloadedFile and os.path.exists(downloadedFile):
-            os.remove(downloadedFile)
+    ok, failed = 0, 0
+    print(f"Processing {len(urls)} link(s) with {min(workers, len(urls))} worker(s)...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(convertOne, u, outputDir): u for u in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                _, path = future.result()
+                ok += 1
+                print(f"[OK]   {url} -> {path}")
+            except Exception as e:
+                failed += 1
+                print(f"[FAIL] {url}: {e}")
+    print(f"Done: {ok} succeeded, {failed} failed.")
 
 def main():
     """
